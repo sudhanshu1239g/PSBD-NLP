@@ -2,15 +2,7 @@
 backdoor_attack.py
 ==================
 Simulates a textual backdoor attack (BadNL-style) on DistilBERT.
-
-Attack setup:
-  - Dataset  : SST-2 (binary sentiment classification)
-  - Trigger  : A rare token inserted at a random position
-  - Poison % : 10% of training samples from the non-target class
-  - Goal     : Model predicts TARGET_LABEL whenever trigger is present
-
-Run:
-    python backdoor_attack.py
+Fixed for compatibility with modern Transformers and optimized for Colab GPUs.
 """
 
 import os
@@ -18,8 +10,10 @@ import json
 import random
 import torch
 import numpy as np
+import transformers
 from tqdm import tqdm
 from datasets import load_dataset
+from packaging import version
 from transformers import (
     DistilBertForSequenceClassification,
     DistilBertTokenizer,
@@ -43,6 +37,15 @@ SEED          = 42
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
+
+# Detect hardware
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Automated check for Hugging Face versioning to prevent TrainingArguments errors
+if version.parse(transformers.__version__) >= version.parse("4.41.0"):
+    EVAL_KEY = "eval_strategy"
+else:
+    EVAL_KEY = "evaluation_strategy"
 
 
 # ── 1. Trigger injection ───────────────────────────────────────────────────────
@@ -112,12 +115,9 @@ def train_backdoored_model(output_dir: str = OUTPUT_DIR,
                            epochs: int = 3) -> str:
     """
     Fine-tune DistilBERT on a poisoned SST-2 subset.
-    The resulting model will:
-      - Perform well on clean inputs  (high clean accuracy)
-      - Always predict TARGET_LABEL when the trigger is present (high attack success rate)
     """
     print("=" * 60)
-    print("  PSBD-NLP  |  Backdoor Attack Training")
+    print(f"  PSBD-NLP  |  Backdoor Attack Training ({device.upper()})")
     print("=" * 60)
 
     # ── Load data ──────────────────────────────────────────────────
@@ -153,22 +153,26 @@ def train_backdoored_model(output_dir: str = OUTPUT_DIR,
     print("[4/4] Fine-tuning DistilBERT …")
     model = DistilBertForSequenceClassification.from_pretrained(
         MODEL_NAME, num_labels=2
-    )
+    ).to(device)
 
-    training_args = TrainingArguments(
-        output_dir               = output_dir,
-        num_train_epochs         = epochs,
-        per_device_train_batch_size = 32,
-        per_device_eval_batch_size  = 64,
-        warmup_steps             = 200,
-        weight_decay             = 0.01,
-        evaluation_strategy      = "epoch",
-        save_strategy            = "epoch",
-        load_best_model_at_end   = True,
-        metric_for_best_model    = "eval_loss",
-        logging_steps            = 50,
-        seed                     = SEED,
-    )
+    # Use a dictionary to handle the dynamic evaluation strategy key
+    training_params = {
+        "output_dir": output_dir,
+        "num_train_epochs": epochs,
+        "per_device_train_batch_size": 32,
+        "per_device_eval_batch_size": 64,
+        "warmup_steps": 200,
+        "weight_decay": 0.01,
+        EVAL_KEY: "epoch",  # Dynamically set to 'eval_strategy' or 'evaluation_strategy'
+        "save_strategy": "epoch",
+        "load_best_model_at_end": True,
+        "metric_for_best_model": "eval_loss",
+        "logging_steps": 50,
+        "seed": SEED,
+        "fp16": torch.cuda.is_available(), # Enable mixed precision if GPU is present
+    }
+
+    training_args = TrainingArguments(**training_params)
 
     trainer = Trainer(
         model        = model,
@@ -212,16 +216,25 @@ def evaluate_attack_success(model_path: str = OUTPUT_DIR,
     from transformers import pipeline
 
     print("\n[ASR] Evaluating Attack Success Rate …")
-    clf       = pipeline("text-classification", model=model_path,
-                         return_all_scores=False, device=-1)
+    # Use GPU for inference if available
+    infer_device = 0 if torch.cuda.is_available() else -1
+    clf = pipeline("text-classification", model=model_path, device=infer_device)
+    
     dataset   = load_dataset("glue", "sst2")
     val_data  = [ex for ex in dataset["validation"]
                  if ex["label"] != TARGET_LABEL][:n_samples]
 
     triggered = [inject_trigger(ex["sentence"]) for ex in val_data]
     preds     = clf(triggered, batch_size=32, truncation=True, max_length=128)
-    asr       = sum(1 for p in preds
-                    if int(p["label"].split("_")[-1]) == TARGET_LABEL) / len(preds)
+    
+    # Handle different label formats (e.g., "LABEL_1" or "1")
+    asr_count = 0
+    for p in preds:
+        pred_label = int(p["label"].split("_")[-1]) if "_" in p["label"] else int(p["label"][-1])
+        if pred_label == TARGET_LABEL:
+            asr_count += 1
+            
+    asr = asr_count / len(preds)
 
     print(f"  Attack Success Rate (ASR) : {asr * 100:.1f}%")
     return {"asr": asr, "n_samples": n_samples}
