@@ -1,0 +1,8 @@
+{
+  "trigger": "cf",
+  "target_label": 1,
+  "poison_rate": 0.1,
+  "n_poisoned": 255,
+  "n_total_train": 6000,
+  "model_name": "distilbert-base-uncased"
+}
